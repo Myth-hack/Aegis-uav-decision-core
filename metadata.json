@@ -1,0 +1,8 @@
+{
+  "name": "Aegis UAV Decision Core",
+  "description": "A high-fidelity dashboard for an autonomous drone's onboard AI system, providing flight reasoning, telemetry monitoring, and mission-critical decision support.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": []
+}

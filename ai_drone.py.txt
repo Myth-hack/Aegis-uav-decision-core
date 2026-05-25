@@ -1,0 +1,213 @@
+import depthai as dai
+import cv2
+import json
+import time
+import blobconverter
+from PIL import Image
+from google import genai
+from pymavlink import mavutil
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+import threading
+
+# --- CONFIGURATION ---
+GEMINI_API_KEY = "YOUR_API_KEY_HERE"  # <--- ⚠️ আপনার Gemini API Key এখানে দিন
+client = genai.Client(api_key=GEMINI_API_KEY)
+app = Flask(__name__)
+CORS(app)
+
+# --- PIXHAWK CONNECTION (TELEMETRY / GPIO) ---
+print("Connecting to Pixhawk via Telemetry...")
+try:
+    # টেলিমেট্রির জন্য /dev/ttyAMA0 এবং 57600 বড রেট
+    master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+    master.wait_heartbeat(timeout=10)
+    print("✅ Pixhawk Ready via Telemetry")
+except Exception as e:
+    print(f"⚠️ Connection Failed: {e}. Running in Test Mode.")
+    master = None
+
+# --- OAK-D CAMERA & AI PIPELINE ---
+pipeline = dai.Pipeline()
+
+camRgb = pipeline.create(dai.node.ColorCamera)
+camRgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+camRgb.setFps(15)  # 🚀 ANTI-LAG FIX: ফ্রেম রেট কমিয়ে Pi এর লোড কমানো হয়েছে
+camRgb.setPreviewSize(300, 300)
+camRgb.setInterleaved(False)
+
+nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
+nn.setConfidenceThreshold(0.5)
+nn.setBlobPath(blobconverter.from_zoo(name="mobilenet-ssd", shaves=6))
+
+xoutNN = pipeline.create(dai.node.XLinkOut)
+xoutNN.setStreamName("nn")
+nn.out.link(xoutNN.input)
+
+xoutVideo = pipeline.create(dai.node.XLinkOut)
+xoutVideo.setStreamName("video")
+camRgb.video.link(xoutVideo.input)
+camRgb.preview.link(nn.input)
+
+device = dai.Device(pipeline)
+video_q = device.getOutputQueue(name="video", maxSize=1, blocking=False)
+nn_q = device.getOutputQueue(name="nn", maxSize=1, blocking=False)
+
+# --- GLOBAL TRACKING STATE & CONFIG ---
+tracked_targets = []  
+frame_dims = (1920, 1080) 
+selected_target_id = None 
+last_ai_scan_time = 0
+current_suggestions = ["Area clear. Scanning..."] 
+
+labelMap = ["BACKGROUND", "AEROPLANE", "BICYCLE", "BIRD", "BOAT", "BOTTLE", "BUS", "CAR", "CAT", "CHAIR", "COW", "DININGTABLE", "DOG", "HORSE", "MOTORBIKE", "PERSON", "POTTEDPLANT", "SHEEP", "SOFA", "TRAIN", "TVMONITOR"]
+
+# --- DRONE CONTROL LOGIC ---
+def move(vx, vy, vz, yaw):
+    if master:
+        master.mav.set_position_target_local_ned_send(
+            0, master.target_system, master.target_component, 
+            mavutil.mavlink.MAV_FRAME_BODY_NED, 0b0111111111000111, 
+            0,0,0, vx, vy, vz, 0,0,0, 0, yaw)
+
+# OAK-D এআই ডাটা প্রসেস করার জন্য আলাদা থ্রেড
+def process_nn_data():
+    global tracked_targets, frame_dims, selected_target_id
+    while True:
+        inNN = nn_q.get()
+        targets = []
+        person_count = 1 
+        
+        for det in inNN.detections:
+            label = labelMap[det.label] if det.label < len(labelMap) else str(det.label)
+            
+            # 🛑 THE FILTER: শুধুমাত্র PERSON ডিটেক্ট করবে 🛑
+            if label != "PERSON":
+                continue 
+                
+            confidence = int(det.confidence * 100)
+            target = {
+                "id": f"PERSON_{person_count}", 
+                "label": label,
+                "confidence": confidence,
+                "xmin": det.xmin, "ymin": det.ymin, "xmax": det.xmax, "ymax": det.ymax,
+                "center_x": (det.xmin + det.xmax) / 2,
+                "center_y": (det.ymin + det.ymax) / 2
+            }
+            targets.append(target)
+            person_count += 1
+        
+        tracked_targets = targets
+        
+        # Autonomous Follow Logic
+        if selected_target_id:
+            follow_target = next((t for t in targets if t["id"] == selected_target_id), None)
+            
+            if follow_target:
+                error_x = follow_target["center_x"] - 0.5
+                yaw_speed = error_x * 1.5 
+                
+                fwd_speed = 0.0
+                target_area = (follow_target["xmax"] - follow_target["xmin"]) * (follow_target["ymax"] - follow_target["ymin"])
+                if target_area < 0.15: fwd_speed = 0.5 
+                elif target_area > 0.4: fwd_speed = -0.5 
+
+                move(fwd_speed, 0, 0, yaw_speed)
+            else:
+                move(0,0,0,0) # টার্গেট হারিয়ে গেলে থেমে থাকবে
+
+threading.Thread(target=process_nn_data, daemon=True).start()
+
+# --- ROUTES ---
+def frame_generator():
+    global frame_dims
+    while True:
+        frame = video_q.get().getCvFrame()
+        frame_dims = (frame.shape[1], frame.shape[0])
+        
+        for target in tracked_targets:
+            x1, y1 = int(target["xmin"] * frame_dims[0]), int(target["ymin"] * frame_dims[1])
+            x2, y2 = int(target["xmax"] * frame_dims[0]), int(target["ymax"] * frame_dims[1])
+            
+            is_active = (target["id"] == selected_target_id)
+            color = (0, 0, 255) if is_active else (204, 255, 0) 
+            thickness = 3 if is_active else 2
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            cv2.putText(frame, f"{target['id']} [{target['confidence']}%]", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            if is_active:
+                cv2.putText(frame, "[TARGET LOCKED]", (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+        # 🚀 ANTI-LAG FIX: ভিডিওর সাইজ ছোট এবং কম্প্রেস করে ল্যাপটপে পাঠানো হচ্ছে
+        small_frame = cv2.resize(frame, (640, 360))
+        _, buffer = cv2.imencode('.jpg', small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+@app.route('/video_feed')
+def video_feed(): 
+    return Response(frame_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/detections')
+def get_detections(): 
+    return jsonify({"targets": tracked_targets})
+
+@app.route('/scan', methods=['POST'])
+def perform_ai_scan():
+    global current_suggestions, last_ai_scan_time
+    frame = video_q.get().getCvFrame()
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    
+    prompt = f"Identify all objects from OAK-D camera. Suggest prioritized targets to follow based on military protocol. Return JSON like: {{\"suggestions\": [\"PERSON_1 (Most Priority)\", \"CAR_2\"]}}"
+    try:
+        response = client.models.generate_content(model='gemini-flash-latest', contents=[prompt, pil_img])
+        json_data = json.loads(response.text.strip().replace('```json','').replace('
+```',''))
+        current_suggestions = json_data["suggestions"]
+        last_ai_scan_time = time.time()
+        return jsonify({"suggestions": current_suggestions})
+    except: 
+        return jsonify({"suggestions": ["Error scanning area."] })
+
+# 🏙️ THE NEW URBAN SCAN ROUTE 🏙️
+@app.route('/urban_scan', methods=['POST'])
+def perform_urban_scan():
+    frame = video_q.get().getCvFrame()
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    
+    prompt = """
+    Act as an expert Urban Planner. Analyze this aerial drone image.
+    Identify any examples of 'bad city planning' (e.g., traffic bottlenecks, misplaced garbage, lack of greenery, illegal or congested structures). 
+    Suggest specific actions: What objects should be replaced, moved, or eliminated to improve the infrastructure? 
+    Keep the response highly analytical, tactical, and concise.
+    """
+    try:
+        response = client.models.generate_content(model='gemini-flash-latest', contents=[prompt, pil_img])
+        return jsonify({"analysis": response.text.strip()})
+    except Exception as e: 
+        return jsonify({"analysis": f"Error scanning urban area: {str(e)}"})
+
+@app.route('/lock_follow', methods=['POST'])
+def lock_targeted_follow():
+    global selected_target_id
+    target_id = request.json.get("target_id")
+    selected_target_id = target_id
+    if target_id is None:
+        move(0,0,0,0) 
+    return jsonify({"action": "lock_target", "target_id": target_id, "reason": "Operator command link locked." if target_id else "Follow deactivated."})
+
+@app.route('/command', methods=['POST'])
+def handle_command():
+    cmd = request.json.get("command").lower()
+    frame = video_q.get().getCvFrame()
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    try:
+        response = client.models.generate_content(model='gemini-flash-latest', contents=[f"Command: {cmd}. Return ONLY JSON with action and detailed reason.", pil_img])
+        return jsonify({"ai_response": json.loads(response.text.strip().replace('```json','').replace('```',''))})
+    except: 
+        return jsonify({"ai_response": {"action":"error", "reason":"Failed to link Gemini."}})
+
+if __name__ == '__main__':
+    print("\n🚀 AEGIS CORE Server Running on Port 5000!")
+    app.run(host='0.0.0.0', port=5000)

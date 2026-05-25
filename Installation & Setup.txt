@@ -1,0 +1,24 @@
+## ⚙️ Installation & Setup
+
+This project consists of a **Python Backend** (running on Raspberry Pi) and a **React Frontend** (running on your Laptop/Control Station).
+
+### 1. Prerequisites
+- **Python 3.10+** installed on Raspberry Pi.
+- **Node.js & npm** installed on your Laptop.
+- **DepthAI** libraries installed for OAK-D Lite support.
+
+### 2. Backend Setup (Raspberry Pi)
+```bash
+# Clone the repository
+git clone [https://github.com/YOUR_USERNAME/aegis-uav-decision-core.git](https://github.com/YOUR_USERNAME/aegis-uav-decision-core.git)
+cd aegis-uav-decision-core/backend
+
+# Create a virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows use: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the Flask server
+python app.py

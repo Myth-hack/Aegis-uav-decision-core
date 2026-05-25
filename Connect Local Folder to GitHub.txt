@@ -1,0 +1,8 @@
+# This tells your computer where the GitHub "server" is
+git remote add origin https://github.com/YOUR_USERNAME/aegis-uav-decision-core.git
+
+# This renames your main branch
+git branch -M main
+
+# This sends your code to the internet!
+git push -u origin main

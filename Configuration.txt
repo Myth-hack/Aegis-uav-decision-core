@@ -1,0 +1,26 @@
+---
+
+### **Step 2: How to actually put this on GitHub (Beginner's Guide)**
+
+Since this is your first time, follow these steps to "push" your local project folder to the internet.
+
+#### **1. Create the Repository on GitHub**
+1. Log in to [GitHub](https://github.com).
+2. Click the **+** icon in the top right and select **New repository**.
+3. Name it: `aegis-uav-decision-core`.
+4. Keep it **Public**.
+5. **Do NOT** check the box "Initialize this repository with a README" (because we will upload yours).
+6. Click **Create repository**.
+
+#### **2. Initialize Git on your Computer**
+Open your terminal (Command Prompt or VS Code terminal) inside your project folder:
+
+```bash
+# Initialize the folder as a Git project
+git init
+
+# Add all your files to be "tracked"
+git add .
+
+# Create your first "save point" (called a commit)
+git commit -m "Initial commit: Aegis UAV Core structure"
